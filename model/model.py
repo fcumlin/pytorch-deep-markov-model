@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from model.modules import Emitter, Transition, Combiner, RnnEncoder
+from model.modules import Emitter, Transition, Combiner, RnnEncoder, FixedLinearEmitter
 import data_loader.polyphonic_dataloader as poly
 from data_loader.seq_util import seq_collate_fn, pack_padded_seq
 from base import BaseModel
@@ -23,10 +23,13 @@ class DeepMarkovModel(BaseModel):
                  train_init,
                  mean_field=False,
                  reverse_rnn_input=True,
-                 sample=True):
+                 sample=True,
+                 use_fixed_emission=True,
+                 H=None):
         super().__init__()
         self.input_dim = input_dim
         self.z_dim = z_dim
+        self.use_fixed_emission = use_fixed_emission
         self.emission_dim = emission_dim
         self.transition_dim = transition_dim
         self.rnn_dim = rnn_dim
@@ -47,9 +50,11 @@ class DeepMarkovModel(BaseModel):
         else:
             rnn_input_dim = input_dim
 
-        # instantiate components of DMM
-        # generative model
-        self.emitter = Emitter(z_dim, emission_dim, input_dim)
+        if use_fixed_emission:
+            self.emitter = FixedLinearEmitter(z_dim, input_dim, H)
+        else:
+            self.emitter = Emitter(z_dim, emission_dim, input_dim)
+
         self.transition = Transition(z_dim, transition_dim,
                                      gated=gated_transition, identity_init=True)
         # inference model
@@ -88,8 +93,11 @@ class DeepMarkovModel(BaseModel):
         if self.use_embedding:
             input = self.embedding(input)
 
-        input = pack_padded_seq(input, x_seq_lengths)
-        h_rnn = self.encoder(input, x_seq_lengths)
+        x_seq_lengths_cpu = x_seq_lengths.cpu()
+        input = pack_padded_seq(input, x_seq_lengths_cpu)
+        
+        # The RNN computation itself happens on GPU
+        h_rnn = self.encoder(input, x_seq_lengths_cpu)
         z_q_0 = self.z_q_0.expand(batch_size, self.z_dim)
         mu_p_0 = self.mu_p_0.expand(batch_size, 1, self.z_dim)
         logvar_p_0 = self.logvar_p_0.expand(batch_size, 1, self.z_dim)

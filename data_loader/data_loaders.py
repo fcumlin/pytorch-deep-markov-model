@@ -2,6 +2,15 @@ from base import BaseDataLoader
 import data_loader.polyphonic_dataloader as poly
 from data_loader.seq_util import seq_collate_fn
 
+from data_loader.danse_markov_dataloader import (
+    LorenzDataLoader, 
+    Lorenz96DataLoader, 
+    BMLmoviDataLoader,
+    LorenzTestDataLoader,
+    Lorenz96TestDataLoader,
+    BMLmoviTestDataLoader
+)
+
 
 class PolyMusicDataLoader(BaseDataLoader):
     def __init__(self,

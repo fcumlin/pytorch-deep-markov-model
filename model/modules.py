@@ -45,6 +45,35 @@ class Emitter(nn.Module):
         return self.lin3(h2)
 
 
+class FixedLinearEmitter(nn.Module):
+    """
+    Fixed linear emission model: x = H * z + w
+    where w ~ N(0, Cw)
+    
+    This replaces the learned Bernoulli emission with a proper linear Gaussian emission.
+    """
+    def __init__(self, z_dim, obs_dim, H=None):
+        super().__init__()
+        self.z_dim = z_dim
+        self.obs_dim = obs_dim
+        
+        if H is None:
+            H = torch.eye(min(z_dim, obs_dim))
+            if z_dim != obs_dim:
+                if z_dim > obs_dim:
+                    H = torch.cat([H, torch.zeros(obs_dim, z_dim - obs_dim)], dim=1)
+                else:
+                    H = H[:z_dim, :]
+        
+        self.register_buffer('H', H)
+        
+    def forward(self, z_t):
+        if z_t.dim() == 3:
+            return torch.einsum('btz,oz->bto', z_t, self.H)
+        else:  # (batch_size, z_dim)
+            return torch.einsum('bz,oz->bo', z_t, self.H)
+
+
 class Transition(nn.Module):
     """
     Parameterize the diagonal Gaussian latent transition probability

@@ -1,0 +1,84 @@
+{
+    "name": "DMM_lorenz",
+    "n_gpu": 1,
+
+    "arch": {
+        "type": "DeepMarkovModel", 
+        "args": {
+            "input_dim": 3,
+            "z_dim": 3,
+            "emission_dim": 3,
+            "transition_dim": 3,
+            "rnn_dim": 32,
+            "rnn_type": "gru",
+            "rnn_layers": 1,
+            "rnn_bidirection": false,
+            "use_embedding": true,
+            "orthogonal_init": true,
+            "gated_transition": true,
+            "train_init": false,
+            "mean_field": false,
+            "reverse_rnn_input": true,
+            "sample": true 
+        }
+    },
+    "data_loader_train": {
+        "type": "LorenzDataLoader",
+        "args":{
+            "num_samples": 1250,
+            "signal_length": 100,
+            "smnr_db": 10,
+            "batch_size": 20,
+            "shuffle": true,
+            "validation_split": 0.2,
+            "num_workers": 1
+        }
+    },
+    "data_loader_valid": {
+        "type": "LorenzDataLoader", 
+        "args":{
+            "num_samples": 200,
+            "signal_length": 100,
+            "smnr_db": 10,
+            "batch_size": 20,
+            "shuffle": false,
+            "validation_split": 0.0,
+            "num_workers": 1
+        }
+    },
+    "data_loader_test": {
+        "type": "LorenzTestDataLoader",
+        "args":{
+            "num_samples": 2000,
+            "signal_length": 1000,
+            "batch_size": 20,
+            "shuffle": false,
+            "num_workers": 1
+        }
+    },
+    "optimizer": {
+        "type": "Adam",
+        "args":{
+            "lr": 0.0008,
+            "weight_decay": 0.0,
+            "amsgrad": true,
+            "betas": [0.9, 0.999]
+        }
+    },
+    "loss": "dmm_loss",
+    "metrics": [
+        "bound_eval"
+    ],
+    "trainer": {
+        "epochs": 3000,
+        "overfit_single_batch": false,
+        "save_dir": "saved/",
+        "save_period": 500,
+        "verbosity": 2,
+        "monitor": "min val_loss",
+        "early_stop": 100,
+        "tensorboard": false,
+        "min_anneal_factor": 0.0,
+        "anneal_update": 5000
+    }
+}

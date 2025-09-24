@@ -1,9 +1,66 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+import torch.nn as nn
 from torchvision.utils import make_grid
 from base import BaseTrainer
 from utils import inf_loop, MetricTracker
+
+
+def _wasserstein_distance_gaussian(mu1, cov1, mu2, cov2):
+    """
+    Compute Wasserstein-2 distance between two multivariate Gaussians.
+    
+    Args:
+        mu1, mu2: means (batch_size, dim)
+        cov1, cov2: covariances (batch_size, dim, dim)
+    
+    Returns:
+        distances: (batch_size,)
+    """
+    batch_size = mu1.shape[0]
+    distances = torch.zeros(batch_size)
+    
+    for i in range(batch_size):
+        # ||mu1 - mu2||^2
+        mean_diff_sq = torch.sum((mu1[i] - mu2[i])**2)
+        
+        # Trace term: tr(cov1 + cov2 - 2*sqrt(cov1^{1/2} * cov2 * cov1^{1/2}))
+        try:
+            # Compute matrix square root of cov1
+            cov1_sqrt = torch.linalg.cholesky(cov1[i])
+            
+            # Compute cov1^{1/2} * cov2 * cov1^{1/2}
+            temp = cov1_sqrt @ cov2[i] @ cov1_sqrt.T
+            
+            # Compute square root of temp
+            temp_sqrt = torch.linalg.cholesky(temp)
+            
+            trace_term = torch.trace(cov1[i]) + torch.trace(cov2[i]) - 2 * torch.trace(temp_sqrt)
+            
+        except:
+            # Fallback: use diagonal approximation if matrices are ill-conditioned
+            trace_term = torch.trace(cov1[i]) + torch.trace(cov2[i]) - 2 * torch.sqrt(
+                torch.trace(cov1[i]) * torch.trace(cov2[i])
+            )
+        
+        distances[i] = mean_diff_sq + trace_term
+    
+    return distances
+
+
+class _TransitionModelWrapper(nn.Module):
+
+    def __init__(self, dmm_model):
+        super().__init__()
+        self.transition = dmm_model.transition
+        
+    def forward(self, prev_state):
+        with torch.no_grad():
+            mu, logvar = self.transition(prev_state)
+            pred_cov = torch.diag_embed(torch.exp(logvar))
+            
+        return mu, pred_cov
 
 
 class Trainer(BaseTrainer):
@@ -62,12 +119,19 @@ class Trainer(BaseTrainer):
         # ----------------
 
         for batch_idx, batch in enumerate(self.data_loader):
-            x, x_reversed, x_mask, x_seq_lengths = batch
-
+            if len(batch) == 5:  # New format with Cws
+                x, x_reversed, x_mask, x_seq_lengths, Cws = batch
+            else:  # Original format
+                x, x_reversed, x_mask, x_seq_lengths = batch
+                Cws = None
+            
+            # Move to device
             x = x.to(self.device)
             x_reversed = x_reversed.to(self.device)
             x_mask = x_mask.to(self.device)
             x_seq_lengths = x_seq_lengths.to(self.device)
+            if Cws is not None:
+                Cws = Cws.to(self.device)
 
             self.optimizer.zero_grad()
             x_recon, z_q_seq, z_p_seq, mu_q_seq, logvar_q_seq, mu_p_seq, logvar_p_seq = \
@@ -77,7 +141,8 @@ class Trainer(BaseTrainer):
                                            self.config['trainer']['anneal_update'],
                                            epoch - 1, self.len_epoch, batch_idx)
             kl_raw, nll_raw, kl_fr, nll_fr, kl_m, nll_m, loss = \
-                self.criterion(x, x_recon, mu_q_seq, logvar_q_seq, mu_p_seq, logvar_p_seq, kl_annealing_factor, x_mask)
+                self.criterion(x, x_recon, mu_q_seq, logvar_q_seq, mu_p_seq, logvar_p_seq, 
+                   kl_annealing_factor, x_mask, Cws)
             loss.backward()
 
             # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 10)
@@ -163,17 +228,25 @@ class Trainer(BaseTrainer):
         self.valid_metrics.reset()
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.valid_data_loader):
-                x, x_reversed, x_mask, x_seq_lengths = batch
-
+                if len(batch) == 5:  # New format with Cws
+                    x, x_reversed, x_mask, x_seq_lengths, Cws = batch
+                else:  # Original format
+                    x, x_reversed, x_mask, x_seq_lengths = batch
+                    Cws = None
+                
+                # Move to device
                 x = x.to(self.device)
                 x_reversed = x_reversed.to(self.device)
                 x_mask = x_mask.to(self.device)
                 x_seq_lengths = x_seq_lengths.to(self.device)
+                if Cws is not None:
+                    Cws = Cws.to(self.device)
 
                 x_recon, z_q_seq, z_p_seq, mu_q_seq, logvar_q_seq, mu_p_seq, logvar_p_seq = \
                     self.model(x, x_reversed, x_seq_lengths)
                 kl_raw, nll_raw, kl_fr, nll_fr, kl_m, nll_m, loss = \
-                    self.criterion(x, x_recon, mu_q_seq, logvar_q_seq, mu_p_seq, logvar_p_seq, 1, x_mask)
+                    self.criterion(x, x_recon, mu_q_seq, logvar_q_seq, mu_p_seq, logvar_p_seq, 
+                   1, x_mask, Cws)
 
                 for l_i, l_i_val in zip(self.log_loss, [loss, nll_m, kl_m]):
                     self.valid_metrics.update(l_i, l_i_val.item())
@@ -208,46 +281,121 @@ class Trainer(BaseTrainer):
         return self.valid_metrics.result()
 
     def _test_epoch(self, epoch):
-        self.model.eval()
-        self.test_metrics.reset()
+        """
+        Test the transition model component only.
+        Expects test_data_loader to provide (prev_state, next_state, mean_next_state, cov_next_state)
+        """
+        if not self.do_test:
+            return {}
+            
+        total_log_likelihood = 0.0
+        total_kl_divergence = 0.0
+        total_wasserstein = 0.0
+        mse = 0.0
+        total_samples = 0
+        has_target_distributions = False
+        
+        # Wrap the transition model
+        markov_state_model = _TransitionModelWrapper(self.model)
+        markov_state_model.eval()
+        
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.test_data_loader):
-                x, x_reversed, x_mask, x_seq_lengths = batch
-
-                x = x.to(self.device)
-                x_reversed = x_reversed.to(self.device)
-                x_mask = x_mask.to(self.device)
-                x_seq_lengths = x_seq_lengths.to(self.device)
-
-                x_recon, z_q_seq, z_p_seq, mu_q_seq, logvar_q_seq, mu_p_seq, logvar_p_seq = \
-                    self.model(x, x_reversed, x_seq_lengths)
-
-                if self.metric_ftns is not None:
-                    for met in self.metric_ftns:
-                        if met.__name__ == 'bound_eval':
-                            self.test_metrics.update(met.__name__,
-                                                     met([x_recon, mu_q_seq, logvar_q_seq],
-                                                         [x, mu_p_seq, logvar_p_seq], mask=x_mask))
-                        if met.__name__ == 'importance_sample':
-                            self.test_metrics.update(met.__name__,
-                                                     met(batch_idx, self.model, x, x_reversed, x_seq_lengths, x_mask, n_sample=500))
-        # ---------------------------------------------------
+                prev_state, next_state, mean_next_state, cov_next_state = batch
+                prev_state = prev_state.to(device=self.device)
+                next_state = next_state.to(device=self.device)
+                
+                # Get model predictions from transition model only
+                pred_mean, pred_cov = markov_state_model(prev_state)
+                
+                # Move to CPU for distribution operations
+                pred_mean_cpu = pred_mean.cpu()
+                pred_cov_cpu = pred_cov.cpu()
+                next_state_cpu = next_state.cpu()
+                
+                # Create predicted distribution
+                try:
+                    pred_dist = torch.distributions.MultivariateNormal(
+                        pred_mean_cpu, pred_cov_cpu
+                    )
+                    log_likelihood = pred_dist.log_prob(next_state_cpu)
+                except:
+                    # Fallback to diagonal if covariance is ill-conditioned
+                    pred_cov_diag = torch.diagonal(pred_cov_cpu, dim1=-2, dim2=-1)
+                    pred_cov_diag = torch.clamp(pred_cov_diag, min=1e-6)  # Ensure positive
+                    pred_dist = torch.distributions.MultivariateNormal(
+                        pred_mean_cpu, torch.diag_embed(pred_cov_diag)
+                    )
+                    log_likelihood = pred_dist.log_prob(next_state_cpu)
+                
+                # Only compute KL divergence and Wasserstein if true distribution is available
+                if isinstance(mean_next_state, torch.Tensor):
+                    has_target_distributions = True
+                    mean_next_state = mean_next_state.to(device=self.device).cpu()
+                    cov_next_state = cov_next_state.to(device=self.device).cpu()
+                    
+                    try:
+                        true_dist = torch.distributions.MultivariateNormal(
+                            mean_next_state, cov_next_state
+                        )
+                        kl_div = torch.distributions.kl_divergence(pred_dist, true_dist)
+                        wasserstein = _wasserstein_distance_gaussian(
+                            pred_mean_cpu, pred_cov_cpu, mean_next_state, cov_next_state
+                        )
+                        
+                        total_kl_divergence += kl_div.sum().item()
+                        total_wasserstein += wasserstein.sum().item()
+                    except Exception as e:
+                        # Skip this batch if distributions are ill-conditioned
+                        self.logger.warning(f"Skipping batch {batch_idx} due to ill-conditioned distributions: {e}")
+                        continue
+                
+                total_log_likelihood += log_likelihood.sum().item()
+                mse += torch.mean((pred_mean_cpu - next_state_cpu) ** 2).item()
+                total_samples += prev_state.shape[0]
+        
+        # Calculate averages
+        avg_mse = mse / total_samples if total_samples > 0 else 0.0
+        avg_log_likelihood = total_log_likelihood / total_samples if total_samples > 0 else 0.0
+        
+        # Prepare results dict
+        test_results = {
+            'mse': avg_mse,
+            'log_likelihood': avg_log_likelihood,
+        }
+        
+        if has_target_distributions:
+            avg_kl_divergence = total_kl_divergence / total_samples
+            avg_wasserstein = total_wasserstein / total_samples
+            test_results.update({
+                'kl_divergence': avg_kl_divergence,
+                'wasserstein_distance': avg_wasserstein
+            })
+        
+        # Log results
+        self.logger.info('----------------------------')
+        self.logger.info('TRANSITION MODEL TEST RESULTS:')
+        self.logger.info(f'Test MSE: {avg_mse:.6f}')
+        self.logger.info(f'Test Log Likelihood: {avg_log_likelihood:.6f}')
+        
+        if has_target_distributions:
+            self.logger.info(f'Test KL Divergence: {avg_kl_divergence:.6f}')
+            self.logger.info(f'Test Wasserstein Distance: {avg_wasserstein:.6f}')
+        else:
+            self.logger.info('KL divergence and Wasserstein distance not computed (no target distributions)')
+        
+        self.logger.info('----------------------------')
+        
+        # Log to tensorboard if available
         if self.writer is not None:
             self.writer.set_step(epoch, 'test')
-            if self.metric_ftns is not None:
-                for met in self.metric_ftns:
-                    self.test_metrics.write_to_logger(met.__name__)
-
-            n_sample = 3
-            output_seq, z_p_seq, mu_p_seq, logvar_p_seq = self.model.generate(n_sample, 100)
-            output_seq = torch.sigmoid(output_seq)
-            plt.close()
-            fig, ax = plt.subplots(n_sample, 1, figsize=(10, n_sample * 10))
-            for i in range(n_sample):
-                ax[i].imshow(output_seq[i].T.cpu().detach().numpy(), origin='lower')
-            self.writer.add_figure('generation', fig)
-        # ---------------------------------------------------
-        return self.test_metrics.result()
+            self.writer.add_scalar('mse', avg_mse)
+            self.writer.add_scalar('log_likelihood', avg_log_likelihood)
+            if has_target_distributions:
+                self.writer.add_scalar('kl_divergence', avg_kl_divergence)
+                self.writer.add_scalar('wasserstein_distance', avg_wasserstein)
+        
+        return test_results
 
     def _progress(self, batch_idx):
         base = '[{}/{} ({:.0f}%)]'

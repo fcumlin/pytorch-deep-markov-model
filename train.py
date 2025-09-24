@@ -31,7 +31,8 @@ def main(config):
         valid_data_loader = None
     try:
         test_data_loader = config.init_obj('data_loader_test', module_data)
-    except Exception:
+    except Exception as e:
+        print(e)
         warnings.warn("Test dataloader not given.")
         test_data_loader = None
 
